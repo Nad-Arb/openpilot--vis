@@ -50,7 +50,7 @@ class CarInterface(object):
 
     # sending if read only is False
     if not read_only:
-      # self.sendcan = messaging.pub_sock(context, service_list['sendcan'].port)
+      self.sendcan = messaging.pub_sock(context, service_list['sendcan'].port)
       self.CC = CarController()
 
   def getVehicleParams(self):
