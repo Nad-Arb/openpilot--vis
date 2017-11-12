@@ -1,0 +1,1233 @@
+From 09b371c688050fe4623c8949b49ffac88a32e88c Mon Sep 17 00:00:00 2001
+From: Vehicle Researcher <user@comma.ai>
+Date: Thu, 16 Mar 2017 12:51:06 -0700
+Subject: [PATCH 1/9] Report rotary encoder status
+
+---
+ board/libc.h                         |  29 +++++++++
+ board/main.c                         | 118 +++++++++++++++++++++++++++++------
+ selfdrive/boardd/boardd.cc           |  25 ++++++++
+ selfdrive/car/honda/carcontroller.py |   2 +-
+ selfdrive/car/honda/carstate.py      |   6 +-
+ selfdrive/car/honda/interface.py     |  12 ++--
+ selfdrive/controls/controlsd.py      |  29 ++++++---
+ selfdrive/manager.py                 |  23 ++++---
+ selfdrive/ui/ui.c                    |  14 +++--
+ 9 files changed, 211 insertions(+), 47 deletions(-)
+
+diff --git a/board/libc.h b/board/libc.h
+index 798de46..1b0f030 100644
+--- a/board/libc.h
++++ b/board/libc.h
+@@ -71,6 +71,10 @@ void clock_init() {
+   RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
+   RCC->APB2ENR |= RCC_APB2ENR_SPI1EN;
+ 
++  #ifdef ENABLE_ROTARY_ENCODER
++  RCC->APB2ENR |= RCC_APB2ENR_SYSCFGEN;
++  #endif
++
+   // turn on alt USB
+   RCC->AHB1ENR |= RCC_AHB1ENR_OTGHSEN;
+ 
+@@ -91,6 +95,7 @@ void gpio_init() {
+     GPIOC->MODER |= GPIO_MODER_MODER8_1;
+     GPIOC->AFR[1] = GPIO_AF2_TIM3 << ((8-8)*4);
+   #endif
++
+   // IGNITION on C13
+ 
+   // set mode for LEDs and CAN
+@@ -102,6 +107,30 @@ void gpio_init() {
+   // CAN enables
+   GPIOB->MODER |= GPIO_MODER_MODER3_0 | GPIO_MODER_MODER4_0;
+ 
++  // Rotary encoder for steering wheel angle measurement.
++  #ifdef ENABLE_ROTARY_ENCODER
++  // EXTI on PB15, input on PB14-PB15
++  int position = 15;
++  int gpiobIndex = 1;
++  SYSCFG->EXTICR[position >> 2U] |= gpiobIndex << (4U * (position & 0x03U));
++
++  uint32_t iocurrent = 1 << position;
++  EXTI->IMR |= iocurrent;
++  EXTI->RTSR |= iocurrent;
++  EXTI->FTSR |= iocurrent;
++  #endif
++
++  // Steering wheel motor
++  #ifdef DIRECTION_AND_PWM
++  // PC7 is direction, PC6 is PWM TIM3_CH1
++  GPIOC->MODER |= GPIO_MODER_MODER6_1 | GPIO_MODER_MODER7_0;
++  GPIOC->AFR[0] = GPIO_AF2_TIM3 << (6*4);
++  #else
++  // PC6 TIM3_CH1, PC7 TIM3_CH2 are PWM for CW and CCW
++  GPIOC->MODER |= GPIO_MODER_MODER6_1 | GPIO_MODER_MODER7_1;
++  GPIOC->AFR[0] = GPIO_AF2_TIM3 << (6*4) | GPIO_AF2_TIM3 << (7*4);
++  #endif
++
+   // set mode for SERIAL and USB (DAC should be configured to in)
+   GPIOA->MODER = GPIO_MODER_MODER2_1 | GPIO_MODER_MODER3_1;
+   GPIOA->AFR[0] = GPIO_AF7_USART2 << (2*4) | GPIO_AF7_USART2 << (3*4);
+diff --git a/board/main.c b/board/main.c
+index 637fdf1..f78bb4e 100644
+--- a/board/main.c
++++ b/board/main.c
+@@ -4,6 +4,8 @@
+ //#define OLD_BOARD
+ //#define ENABLE_CURRENT_SENSOR
+ //#define ENABLE_SPI
++#define DIRECTION_AND_PWM
++//#define ENABLE_ROTARY_ENCODER
+ 
+ // choose serial port for debugging
+ //#define USART USART2
+@@ -261,7 +263,43 @@ void USART3_IRQHandler(void) {
+   USART_IRQHandler();
+ }
+ 
++int lastA = 0;
++int lastB = 0;
++int rotary_encoder_count = 0;
++
++// PB15 is pin A (EXTI), PB14 is pin B.
++uint32_t GPIO_PIN_14 = 1 << 14;
++uint32_t GPIO_PIN_15 = 1 << 15;
++
++void handle_rotary_encoder() {
++  int currentA = (GPIOB->IDR & GPIO_PIN_15) != 0;
++  int currentB = (GPIOB->IDR & GPIO_PIN_14) != 0;
++  if (lastA != currentA) {
++    lastA = currentA;
++    if (lastA == 0) {
++      if (currentB) {
++        rotary_encoder_count++;
++      } else {
++        rotary_encoder_count--;
++      }
++    }
++  }
++
++  #if 0
++  int fan_speed = count * 1024 * 8;
++  fan_speed = min(0xFFFF, max(0, fan_speed));
++  set_fan_speed(fan_speed);
++  #endif
++}
++
+ // ***************************** USB port *****************************
++void EXTI15_10_IRQHandler(void) {
++  // EXTI on PB15
++  if (EXTI->PR & GPIO_PIN_15) {
++    EXTI->PR |= GPIO_PIN_15;
++    handle_rotary_encoder();
++  }
++}
+ 
+ int get_health_pkt(void *dat) {
+   struct {
+@@ -280,7 +318,7 @@ int get_health_pkt(void *dat) {
+ #endif
+   health->started = started;
+ 
+-  health->controls_allowed = controls_allowed;
++  health->controls_allowed = 1; // controls_allowed;
+ 
+   health->gas_interceptor_detected = gas_interceptor_detected;
+   health->started_signal_detected = started_signal_detected;
+@@ -295,6 +333,35 @@ void set_fan_speed(int fan_speed) {
+   #endif
+ }
+ 
++void set_streering_torque(int16_t torque) {
++
++  int clockwise = torque > 0;
++  // Spent one bit on sign, scale back up to 0xFFFF.
++  // With less than minimal cutoff, the motor doesn't spin at all.
++  int timerCCRx = max(0xFFF, min(0x7FFF, abs(torque) * 2));
++  timerCCRx = torque == 0 ? 0 : timerCCRx;
++
++  #ifdef DIRECTION_AND_PWM
++  // PWM on PC6 (channel 1), direction on PC7
++  TIM3->CCR1 = timerCCRx;
++  if (clockwise) {
++    GPIOC->ODR |= (1 << 7);
++  } else {
++    GPIOC->ODR &= ~(1 << 7);
++  }
++  #else
++  // Cloclwise torque on channel 1, counterclockwise on channel 2.
++  if (clockwise) {
++    TIM3->CCR1 = timerCCRx;
++    TIM3->CCR2 = 0;
++  } else {
++    TIM3->CCR1 = 0;
++    TIM3->CCR2 = timerCCRx;
++  }
++  #endif
++}
++
++
+ void usb_cb_ep1_in(int len) {
+   CAN_FIFOMailBox_TypeDef reply[4];
+ 
+@@ -315,6 +382,9 @@ void usb_cb_ep2_out(uint8_t *usbdata, int len) {
+ 
+ // send on CAN
+ void usb_cb_ep3_out(uint8_t *usbdata, int len) {
++
++  return;
++
+   int dpkt = 0;
+   for (dpkt = 0; dpkt < len; dpkt += 0x10) {
+     uint32_t *tf = (uint32_t*)(&usbdata[dpkt]);
+@@ -370,6 +440,15 @@ void usb_cb_control_msg() {
+     case 0xd8: // RESET
+       NVIC_SystemReset();
+       break;
++    case 0xd9: // Steering torque
++      set_streering_torque(setup.b.wValue.w);
++      USB_WritePacket(0, 0, 0);
++      USBx_OUTEP(0)->DOEPCTL |= USB_OTG_DOEPCTL_CNAK;
++      break;
++    case 0xda: // Steering wheel angle data 
++      USB_WritePacket((uint8_t*)&rotary_encoder_count, sizeof(rotary_encoder_count), 0);
++      USBx_OUTEP(0)->DOEPCTL |= USB_OTG_DOEPCTL_CNAK;
++      break;
+     default:
+       puts("NO HANDLER ");
+       puth(setup.b.bRequest);
+@@ -492,13 +571,9 @@ int main() {
+ #endif
+ 
+   // timer for fan PWM
+-  #ifdef OLD_BOARD
+-    TIM3->CCMR2 = TIM_CCMR2_OC4M_2 | TIM_CCMR2_OC4M_1;
+-    TIM3->CCER = TIM_CCER_CC4E;
+-  #else
+-    TIM3->CCMR2 = TIM_CCMR2_OC3M_2 | TIM_CCMR2_OC3M_1;
+-    TIM3->CCER = TIM_CCER_CC3E;
+-  #endif
++  TIM3->CCMR2 = TIM_CCMR2_OC3M_2 | TIM_CCMR2_OC3M_1;
++  TIM3->CCMR1 = TIM_CCMR1_OC1M_2 | TIM_CCMR1_OC1M_1 | TIM_CCMR1_OC2M_2 | TIM_CCMR1_OC2M_1;
++  TIM3->CCER = TIM_CCER_CC1E | TIM_CCER_CC2E | TIM_CCER_CC3E;
+ 
+   // max value of the timer
+   // 64 makes it above the audible range
+@@ -508,7 +583,8 @@ int main() {
+   timer_init(TIM3, 10);
+ 
+   // set PWM
+-  set_fan_speed(65535);
++  set_fan_speed(0x7FFF);
++  set_streering_torque(0);
+ 
+   puts("**** INTERRUPTS ON ****\n");
+   __disable_irq();
+@@ -531,8 +607,13 @@ int main() {
+   NVIC_EnableIRQ(DMA2_Stream3_IRQn);
+   NVIC_EnableIRQ(SPI1_IRQn);
+ #endif
+-  __enable_irq();
+ 
++#ifdef ENABLE_ROTARY_ENCODER
++  NVIC_SetPriority(EXTI15_10_IRQn, 3);
++  NVIC_EnableIRQ(EXTI15_10_IRQn);
++#endif
++
++  __enable_irq();
+ 
+   // LED should keep on blinking all the time
+   int cnt;
+@@ -552,9 +633,6 @@ int main() {
+     /*puts("voltage: "); puth(adc_get(ADCCHAN_VOLTAGE)); puts("  ");
+     puts("current: "); puth(adc_get(ADCCHAN_CURRENT)); puts("\n");*/
+ 
+-    // set LED to be controls allowed
+-    GPIOB->ODR = (GPIOB->ODR | (1 << 11)) & ~(controls_allowed << 11);
+-
+     // blink the other LED if in FS mode
+     if (USBx == USB_OTG_FS) {
+       GPIOB->ODR |= (1 << 10);
+@@ -574,16 +652,16 @@ int main() {
+     int started_signal = (GPIOC->IDR & (1 << 13)) != 0;
+     if (started_signal) { started_signal_detected = 1; }
+ 
+-    if (started_signal || (!started_signal_detected && can_live)) {
+-      started = 1;
++    // set LED to be started signal // controls allowed
++    GPIOB->ODR = (GPIOB->ODR | (1 << 11)) & ~(started_signal << 11);
+ 
+-      // turn on fan at half speed
+-      set_fan_speed(32768);
++    if (started_signal) {
++      started = 1;
++      set_fan_speed(0xFFFF);
+     } else {
+       started = 0;
+-
+-      // turn off fan
+-      set_fan_speed(0);
++      set_fan_speed(0xFFFF);
++      set_streering_torque(0);
+     }
+   }
+ 
+diff --git a/selfdrive/boardd/boardd.cc b/selfdrive/boardd/boardd.cc
+index 15cea0b..dc65768 100644
+--- a/selfdrive/boardd/boardd.cc
++++ b/selfdrive/boardd/boardd.cc
+@@ -183,6 +183,31 @@ void can_send(void *s) {
+ 
+   capnp::FlatArrayMessageReader cmsg(amsg);
+   cereal::Event::Reader event = cmsg.getRoot<cereal::Event>();
++
++  if (event.isCarControl()) {
++
++    float steeringTorque = event.getCarControl().getSteeringTorque();
++
++    // Convert to 16-bit signed integer
++    int torqueScale = 0x7fff;
++    int steeringTorqueControl = steeringTorque * torqueScale;
++    if (steeringTorqueControl > torqueScale)
++        steeringTorqueControl = torqueScale;
++    else if (steeringTorqueControl < -torqueScale)
++        steeringTorqueControl = -torqueScale;
++
++    // send to board
++    pthread_mutex_lock(&usb_lock);
++    do {
++      err = libusb_control_transfer(dev_handle, 0x40, 0xd9, (uint16_t)steeringTorqueControl, 0, NULL, 0, TIMEOUT);
++      if (err != 0) {
++        handle_usb_issue(err, __func__);
++      }
++    } while (err != 0);
++    pthread_mutex_unlock(&usb_lock);
++    return;
++  }
++
+   int msg_count = event.getCan().size();
+ 
+   uint32_t *send = (uint32_t*)malloc(msg_count*0x10);
+diff --git a/selfdrive/car/honda/carcontroller.py b/selfdrive/car/honda/carcontroller.py
+index f7d7b72..88dabd3 100644
+--- a/selfdrive/car/honda/carcontroller.py
++++ b/selfdrive/car/honda/carcontroller.py
+@@ -186,5 +186,5 @@ class CarController(object):
+       idx = (frame/radar_send_step) % 4
+       can_sends.extend(hondacan.create_radar_commands(CS.v_ego, CS.civic, idx))
+ 
+-    sendcan.send(can_list_to_can_capnp(can_sends, msgtype='sendcan').to_bytes())
++    # sendcan.send(can_list_to_can_capnp(can_sends, msgtype='sendcan').to_bytes())
+ 
+diff --git a/selfdrive/car/honda/carstate.py b/selfdrive/car/honda/carstate.py
+index 1da53d1..9c69b43 100644
+--- a/selfdrive/car/honda/carstate.py
++++ b/selfdrive/car/honda/carstate.py
+@@ -164,7 +164,11 @@ def fingerprint(logcan):
+ class CarState(object):
+   def __init__(self, logcan):
+     self.torque_mod = False
+-    self.brake_only, self.car_type = fingerprint(logcan)
++
++    self.brake_only = False
++    # self.brake_only, self.car_type = fingerprint(logcan)
++    # self.car_type = "HONDA CIVIC 2016 TOURING"
++    self.car_type = "ACURA ILX 2016 ACURAWATCH PLUS"
+ 
+     # assuming if you have a pedal interceptor you also have a torque mod
+     if not self.brake_only:
+diff --git a/selfdrive/car/honda/interface.py b/selfdrive/car/honda/interface.py
+index 4286656..bca64e6 100755
+--- a/selfdrive/car/honda/interface.py
++++ b/selfdrive/car/honda/interface.py
+@@ -49,7 +49,7 @@ class CarInterface(object):
+ 
+     # sending if read only is False
+     if not read_only:
+-      self.sendcan = messaging.pub_sock(context, service_list['sendcan'].port)
++      # self.sendcan = messaging.pub_sock(context, service_list['sendcan'].port)
+       self.CC = CarController()
+ 
+   def getVehicleParams(self):
+@@ -57,13 +57,11 @@ class CarInterface(object):
+ 
+   # returns a car.CarState
+   def update(self):
+-    # ******************* do can recv *******************
+-    can_pub_main = []
+-    canMonoTimes = []
++    # ******************* do recv *******************
+     for a in messaging.drain_sock(self.logcan):
+-      canMonoTimes.append(a.logMonoTime)
+-      can_pub_main.extend(can_capnp_to_can_list(a.can, [0,2]))
+-    self.CS.update(can_pub_main)
++      ret = a.carState
++
++    return ret.as_reader()
+ 
+     # create message
+     ret = car.CarState.new_message()
+diff --git a/selfdrive/controls/controlsd.py b/selfdrive/controls/controlsd.py
+index 02566a8..fdb3da0 100755
+--- a/selfdrive/controls/controlsd.py
++++ b/selfdrive/controls/controlsd.py
+@@ -40,6 +40,7 @@ def controlsd_thread(gctx, rate=100):  #rate in Hz
+   live100 = messaging.pub_sock(context, service_list['live100'].port)
+   carstate = messaging.pub_sock(context, service_list['carState'].port)
+   carcontrol = messaging.pub_sock(context, service_list['carControl'].port)
++  sendcan = messaging.pub_sock(context, service_list['sendcan'].port)
+ 
+   thermal = messaging.sub_sock(context, service_list['thermal'].port)
+   live20 = messaging.sub_sock(context, service_list['live20'].port)
+@@ -88,7 +89,16 @@ def controlsd_thread(gctx, rate=100):  #rate in Hz
+     cur_time = sec_since_boot()
+ 
+     # read CAN
+-    CS = CI.update()
++    # CS = CI.update()
++    CS = car.CarState.new_message()
++
++    # Hack-hack - hardcode 27 = 60mph
++    CS.vEgo = 13
++    CS.wheelSpeeds.fl = CS.vEgo
++    CS.wheelSpeeds.fr = CS.vEgo
++    CS.wheelSpeeds.rl = CS.vEgo
++    CS.wheelSpeeds.rr = CS.vEgo
++    CS.steeringAngle = 0
+ 
+     # broadcast carState
+     cs_send = messaging.new_message()
+@@ -155,7 +165,7 @@ def controlsd_thread(gctx, rate=100):  #rate in Hz
+ 
+     # thermal data, checked every second
+     td = messaging.recv_sock(thermal)
+-    if td is not None:
++    if False and td is not None:
+       # Check temperature.
+       overtemp = any(
+           t > 950
+@@ -197,12 +207,16 @@ def controlsd_thread(gctx, rate=100):  #rate in Hz
+     else:
+       enable_condition = enable_request
+ 
++    # Hack-hack
++    enable_request = True
++    enable_condition = True
++
+     if enable_request or enable_condition or enabled:
+       # add all alerts from car
+       for alert in CS.errors:
+         AM.add(alert, enabled)
+ 
+-      if AC.dead:
++      if False and AC.dead:
+         AM.add("radarCommIssue", enabled)
+ 
+       if PP.dead:
+@@ -251,7 +265,7 @@ def controlsd_thread(gctx, rate=100):  #rate in Hz
+ 
+     # ***** handle alerts ****
+     # send a "steering required alert" if saturation count has reached the limit
+-    if sat_flag:
++    if False and sat_flag:
+       AM.add("steerSaturated", enabled)
+ 
+     if enabled and AM.alertShouldDisable():
+@@ -295,14 +309,15 @@ def controlsd_thread(gctx, rate=100):  #rate in Hz
+     CC.hudControl.audibleAlert = audible_alert
+ 
+     # this alert will apply next controls cycle
+-    if not CI.apply(CC):
+-      AM.add("controlsFailed", enabled)
++    #if not CI.apply(CC):
++    #  AM.add("controlsFailed", enabled)
+ 
+     # broadcast carControl
+     cc_send = messaging.new_message()
+     cc_send.init('carControl')
+     cc_send.carControl = CC    # copy?
+-    carcontrol.send(cc_send.to_bytes())
++    #carcontrol.send(cc_send.to_bytes())
++    sendcan.send(cc_send.to_bytes())
+ 
+     prof.checkpoint("CarControl")
+ 
+diff --git a/selfdrive/manager.py b/selfdrive/manager.py
+index 9971686..0d38a34 100755
+--- a/selfdrive/manager.py
++++ b/selfdrive/manager.py
+@@ -27,7 +27,7 @@ from selfdrive.loggerd.config import ROOT
+ managed_processes = {
+   "uploader": "selfdrive.loggerd.uploader",
+   "controlsd": "selfdrive.controls.controlsd",
+-  "radard": "selfdrive.controls.radard",
++  #"radard": "selfdrive.controls.radard",
+   "calibrationd": "selfdrive.calibrationd.calibrationd",
+   "loggerd": "selfdrive.loggerd.loggerd",
+   "logmessaged": "selfdrive.logmessaged",
+@@ -148,13 +148,22 @@ def manager_init():
+   common.crash.bind_user(dongle_id=dongle_id)
+ 
+   # set gctx
+-  gctx = {
+-    "calibration": {
+-      "initial_homography": [1.15728010e+00, -4.69379619e-02, 7.46450623e+01,
+-                             7.99253014e-02, 1.06372458e+00, 5.77762553e+01,
+-                             9.35543519e-05, -1.65429898e-04, 9.98062699e-01]
++  if False:
++    gctx = {
++      "calibration": {
++        "initial_homography": [1.15728010e+00, -4.69379619e-02, 7.46450623e+01,
++                               7.99253014e-02, 1.06372458e+00, 5.77762553e+01,
++                               9.35543519e-05, -1.65429898e-04, 9.98062699e-01]
++      }
++    }
++  else:
++    gctx = {
++      "calibration": {
++        "initial_homography": [1, 0, 150,
++                               0, 1, 10,
++                               0, 0, 1]
++      }
+     }
+-  }
+ 
+ def manager_thread():
+   # now loop
+diff --git a/selfdrive/ui/ui.c b/selfdrive/ui/ui.c
+index a2b26b3..e9c2498 100644
+--- a/selfdrive/ui/ui.c
++++ b/selfdrive/ui/ui.c
+@@ -1159,6 +1159,7 @@ static void ui_update(UIState *s) {
+   uint64_t ts = nanos_since_boot();
+   if (!s->vision_connected && ts - s->last_base_update > 1000000000ULL) {
+     char* bat_cap = read_file("/sys/class/power_supply/battery/capacity");
++    char* bat_temp = read_file("/sys/class/power_supply/battery/temp");
+     char* bat_stat = read_file("/sys/class/power_supply/battery/status");
+ 
+     int tx_rate = 0;
+@@ -1194,11 +1195,14 @@ static void ui_update(UIState *s) {
+ 
+     s->board_connected = !system("lsusb | grep bbaa > /dev/null");
+ 
++    system("ifconfig | awk '/inet addr/{print substr($2,6)}' | sed -n 2p > /tmp/ipaddr");
++    char *ipaddr = read_file("/tmp/ipaddr");
++
+     snprintf(s->base_text, sizeof(s->base_text),
+-             "version: v%s %s (%s)\nserial: %s\n dongle id: %s\n battery: %s %s\npending: %d -> %.1f kb/s\nboard: %s",
+-             openpilot_version, git_commit, git_branch,
+-             s->serial, s->dongle_id, bat_cap ? bat_cap : "(null)", bat_stat ? bat_stat : "(null)",
+-             pending, tx_rate / 1024.0, s->board_connected ? "found" : "NOT FOUND");
++             "battery: %s %s temp %s\npending: %d -> %.1f kb/s\nboard: %s net: %s",
++             bat_cap ? bat_cap : "(null)", bat_stat ? bat_stat : "(null)",
++             bat_temp ? bat_temp : "(null)",
++             pending, tx_rate / 1024.0, s->board_connected ? "yes" : "no", ipaddr ? ipaddr : "(null");
+ 
+     if (bat_cap) free(bat_cap);
+     if (bat_stat) free(bat_stat);
+@@ -1206,6 +1210,8 @@ static void ui_update(UIState *s) {
+     if (git_branch) free(git_branch);
+     if (git_commit) free(git_commit);
+ 
++    if (ipaddr) free(ipaddr);
++
+     s->last_base_update = ts;
+ 
+     if (!activity_running()) {
+-- 
+2.9.2
+
+
+From e190ddf71a76a2d1cfbe9ca52d3f583c4c27429a Mon Sep 17 00:00:00 2001
+From: Vehicle Researcher <user@comma.ai>
+Date: Thu, 16 Mar 2017 13:38:26 -0700
+Subject: [PATCH 2/9] Slow down fan when not started
+
+---
+ board/main.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/board/main.c b/board/main.c
+index f78bb4e..b25ed12 100644
+--- a/board/main.c
++++ b/board/main.c
+@@ -445,7 +445,7 @@ void usb_cb_control_msg() {
+       USB_WritePacket(0, 0, 0);
+       USBx_OUTEP(0)->DOEPCTL |= USB_OTG_DOEPCTL_CNAK;
+       break;
+-    case 0xda: // Steering wheel angle data 
++    case 0xda: // Steering wheel angle data
+       USB_WritePacket((uint8_t*)&rotary_encoder_count, sizeof(rotary_encoder_count), 0);
+       USBx_OUTEP(0)->DOEPCTL |= USB_OTG_DOEPCTL_CNAK;
+       break;
+@@ -660,7 +660,7 @@ int main() {
+       set_fan_speed(0xFFFF);
+     } else {
+       started = 0;
+-      set_fan_speed(0xFFFF);
++      set_fan_speed(0x7FFF);
+       set_streering_torque(0);
+     }
+   }
+-- 
+2.9.2
+
+
+From 01b186dd016f1c54e31152140dfb7d94f124bd6c Mon Sep 17 00:00:00 2001
+From: Vehicle Researcher <user@comma.ai>
+Date: Thu, 16 Mar 2017 13:39:48 -0700
+Subject: [PATCH 3/9] Propagate rotary encoder data to steering angle
+
+---
+ selfdrive/boardd/boardd.cc       | 45 +++++++++++-----------------------------
+ selfdrive/car/honda/interface.py | 20 +++++++++++++++---
+ selfdrive/controls/controlsd.py  | 11 +---------
+ 3 files changed, 30 insertions(+), 46 deletions(-)
+
+diff --git a/selfdrive/boardd/boardd.cc b/selfdrive/boardd/boardd.cc
+index dc65768..25599f0 100644
+--- a/selfdrive/boardd/boardd.cc
++++ b/selfdrive/boardd/boardd.cc
+@@ -68,53 +68,32 @@ void handle_usb_issue(int err, const char func[]) {
+ 
+ void can_recv(void *s) {
+   int err;
+-  uint32_t data[RECV_SIZE/4];
+-  int recv;
+-  uint32_t f1, f2;
++  int cnt;
++
++  struct status {
++    int32_t rotaryEncoderCount;
++  } status;
+ 
+   // do recv
+   pthread_mutex_lock(&usb_lock);
+- 
+-  do {
+-    err = libusb_bulk_transfer(dev_handle, 0x81, (uint8_t*)data, RECV_SIZE, &recv, TIMEOUT);
+-    if (err != 0) { handle_usb_issue(err, __func__); }
+-    if (err == -8) { LOGE("overflow got 0x%x", recv); };
+ 
+-    // timeout is okay to exit, recv still happened
+-    if (err == -7) { break; }
+-  } while(err != 0);
++  do {
++    cnt = libusb_control_transfer(dev_handle, 0xc0, 0xda, 0, 0, (unsigned char*)&status, sizeof(status), TIMEOUT);
++    if (cnt != sizeof(status)) { handle_usb_issue(cnt, __func__); }
++  } while(cnt != sizeof(status));
+ 
+   pthread_mutex_unlock(&usb_lock);
+ 
+-  // return if length is 0
+-  if (recv <= 0) {
+-    return;
+-  }
+-
+   // create message
+   capnp::MallocMessageBuilder msg;
+   cereal::Event::Builder event = msg.initRoot<cereal::Event>();
+   event.setLogMonoTime(nanos_since_boot());
+ 
+-  auto canData = event.initCan(recv/0x10);
++  auto carState = event.initCarState();
+ 
+-  // populate message
+-  for (int i = 0; i<(recv/0x10); i++) {
+-    if (data[i*4] & 4) {
+-      // extended
+-      canData[i].setAddress(data[i*4] >> 3);
+-      //printf("got extended: %x\n", data[i*4] >> 3);
+-    } else {
+-      // normal
+-      canData[i].setAddress(data[i*4] >> 21);
+-    }
+-    canData[i].setBusTime(data[i*4+1] >> 16);
+-    int len = data[i*4+1]&0xF;
+-    canData[i].setDat(kj::arrayPtr((uint8_t*)&data[i*4+2], len));
+-    canData[i].setSrc((data[i*4+1] >> 4) & 3);
+-  }
++  carState.setSteeringAngle(0.1 * status.rotaryEncoderCount);
+ 
+-  // send to can
++  // send
+   auto words = capnp::messageToFlatArray(msg);
+   auto bytes = words.asBytes();
+   zmq_send(s, bytes.begin(), bytes.size(), 0); 
+diff --git a/selfdrive/car/honda/interface.py b/selfdrive/car/honda/interface.py
+index bca64e6..5010e3a 100755
+--- a/selfdrive/car/honda/interface.py
++++ b/selfdrive/car/honda/interface.py
+@@ -46,6 +46,12 @@ class CarInterface(object):
+ 
+     # *** init the major players ***
+     self.CS = CarState(self.logcan)
++    self.CS.angle_steers = 0.0;
++
++    # Hack-hack - hardcode 27 = 60mph
++    vEgo = 13;
++    self.CS.vEgo = vEgo
++    self.CS.steeringAngle = 0
+ 
+     # sending if read only is False
+     if not read_only:
+@@ -57,15 +63,23 @@ class CarInterface(object):
+ 
+   # returns a car.CarState
+   def update(self):
++
+     # ******************* do recv *******************
+     for a in messaging.drain_sock(self.logcan):
+-      ret = a.carState
+-
+-    return ret.as_reader()
++      self.CS.angle_steers = a.carState.steeringAngle
+ 
+     # create message
+     ret = car.CarState.new_message()
+ 
++    ret.steeringAngle = self.CS.angle_steers
++
++    ret.wheelSpeeds.fl = self.CS.vEgo
++    ret.wheelSpeeds.fr = self.CS.vEgo
++    ret.wheelSpeeds.rl = self.CS.vEgo
++    ret.wheelSpeeds.rr = self.CS.vEgo
++
++    return ret.as_reader()
++
+     # speeds
+     ret.vEgo = self.CS.v_ego
+     ret.wheelSpeeds.fl = self.CS.cp.vl[0x1D0]['WHEEL_SPEED_FL']
+diff --git a/selfdrive/controls/controlsd.py b/selfdrive/controls/controlsd.py
+index fdb3da0..898f437 100755
+--- a/selfdrive/controls/controlsd.py
++++ b/selfdrive/controls/controlsd.py
+@@ -89,16 +89,7 @@ def controlsd_thread(gctx, rate=100):  #rate in Hz
+     cur_time = sec_since_boot()
+ 
+     # read CAN
+-    # CS = CI.update()
+-    CS = car.CarState.new_message()
+-
+-    # Hack-hack - hardcode 27 = 60mph
+-    CS.vEgo = 13
+-    CS.wheelSpeeds.fl = CS.vEgo
+-    CS.wheelSpeeds.fr = CS.vEgo
+-    CS.wheelSpeeds.rl = CS.vEgo
+-    CS.wheelSpeeds.rr = CS.vEgo
+-    CS.steeringAngle = 0
++    CS = CI.update()
+ 
+     # broadcast carState
+     cs_send = messaging.new_message()
+-- 
+2.9.2
+
+
+From e7fb3a996d5090d1400d9f8dfe59ff5c42f6b494 Mon Sep 17 00:00:00 2001
+From: Vehicle Researcher <user@comma.ai>
+Date: Thu, 16 Mar 2017 20:21:35 -0700
+Subject: [PATCH 4/9] Refactor pin selection
+
+---
+ board/libc.h | 15 +++++++--------
+ board/main.c | 57 ++++++++++++++++++++++++++++++++++++---------------------
+ 2 files changed, 43 insertions(+), 29 deletions(-)
+
+diff --git a/board/libc.h b/board/libc.h
+index 1b0f030..2479aec 100644
+--- a/board/libc.h
++++ b/board/libc.h
+@@ -110,21 +110,20 @@ void gpio_init() {
+   // Rotary encoder for steering wheel angle measurement.
+   #ifdef ENABLE_ROTARY_ENCODER
+   // EXTI on PB15, input on PB14-PB15
+-  int position = 15;
++  int position = ROTARY_ENCODER_EXTI_POSITION;
+   int gpiobIndex = 1;
+   SYSCFG->EXTICR[position >> 2U] |= gpiobIndex << (4U * (position & 0x03U));
+ 
+-  uint32_t iocurrent = 1 << position;
+-  EXTI->IMR |= iocurrent;
+-  EXTI->RTSR |= iocurrent;
+-  EXTI->FTSR |= iocurrent;
++  EXTI->IMR |= ROTARY_ENCODER_EXTI_PIN;
++  EXTI->RTSR |= ROTARY_ENCODER_EXTI_PIN;
++  EXTI->FTSR |= ROTARY_ENCODER_EXTI_PIN;
+   #endif
+ 
+   // Steering wheel motor
+   #ifdef DIRECTION_AND_PWM
+-  // PC7 is direction, PC6 is PWM TIM3_CH1
+-  GPIOC->MODER |= GPIO_MODER_MODER6_1 | GPIO_MODER_MODER7_0;
+-  GPIOC->AFR[0] = GPIO_AF2_TIM3 << (6*4);
++  // PC6 is direction, PC7 is PWM TIM3_CH2
++  GPIOC->MODER |= GPIO_MODER_MODER6_0 | GPIO_MODER_MODER7_1;
++  GPIOC->AFR[0] = GPIO_AF2_TIM3 << (7*4);
+   #else
+   // PC6 TIM3_CH1, PC7 TIM3_CH2 are PWM for CW and CCW
+   GPIOC->MODER |= GPIO_MODER_MODER6_1 | GPIO_MODER_MODER7_1;
+diff --git a/board/main.c b/board/main.c
+index b25ed12..5d25e7c 100644
+--- a/board/main.c
++++ b/board/main.c
+@@ -4,13 +4,30 @@
+ //#define OLD_BOARD
+ //#define ENABLE_CURRENT_SENSOR
+ //#define ENABLE_SPI
+-#define DIRECTION_AND_PWM
+-//#define ENABLE_ROTARY_ENCODER
+ 
+ // choose serial port for debugging
+ //#define USART USART2
+ #define USART USART3
+ 
++#define GPIO_PIN_6 (1 << 6)
++#define GPIO_PIN_7 (1 << 7)
++#define GPIO_PIN_14 (1 << 15)
++#define GPIO_PIN_15 (1 << 15)
++
++#define ENABLE_ROTARY_ENCODER
++#define ROTARY_ENCODER_EXTI_POSITION 15
++#define ROTARY_ENCODER_PIN_A GPIO_PIN_15
++#define ROTARY_ENCODER_PIN_B GPIO_PIN_14
++#define ROTARY_ENCODER_GPIO GPIOB
++#define ROTARY_ENCODER_EXTI_PIN ROTARY_ENCODER_PIN_A 
++#define ROTARY_ENCODER_INTERRUPT EXTI15_10_IRQn
++
++#define DIRECTION_AND_PWM
++#define MOTOR_DRIVER_PWM_TIMER_CHANNEL (TIM3->CCR2)
++#define MOTOR_DRIVER_SPEED_PIN GPIO_PIN_7
++#define MOTOR_DRIVER_DIRECTION_PIN GPIO_PIN_6
++#define MOTOR_DRIVER_GPIO GPIOC
++
+ #define USB_VID 0xbbaa
+ #define USB_PID 0xddcc
+ 
+@@ -267,13 +284,13 @@ int lastA = 0;
+ int lastB = 0;
+ int rotary_encoder_count = 0;
+ 
+-// PB15 is pin A (EXTI), PB14 is pin B.
+-uint32_t GPIO_PIN_14 = 1 << 14;
+-uint32_t GPIO_PIN_15 = 1 << 15;
+-
+ void handle_rotary_encoder() {
+-  int currentA = (GPIOB->IDR & GPIO_PIN_15) != 0;
+-  int currentB = (GPIOB->IDR & GPIO_PIN_14) != 0;
++
++  if (!started)
++    return;
++
++  int currentA = (ROTARY_ENCODER_GPIO->IDR & ROTARY_ENCODER_PIN_A) != 0;
++  int currentB = (ROTARY_ENCODER_GPIO->IDR & ROTARY_ENCODER_PIN_B) != 0;
+   if (lastA != currentA) {
+     lastA = currentA;
+     if (lastA == 0) {
+@@ -294,9 +311,8 @@ void handle_rotary_encoder() {
+ 
+ // ***************************** USB port *****************************
+ void EXTI15_10_IRQHandler(void) {
+-  // EXTI on PB15
+-  if (EXTI->PR & GPIO_PIN_15) {
+-    EXTI->PR |= GPIO_PIN_15;
++  if (EXTI->PR & ROTARY_ENCODER_EXTI_PIN) {
++    EXTI->PR |= ROTARY_ENCODER_EXTI_PIN;
+     handle_rotary_encoder();
+   }
+ }
+@@ -333,7 +349,7 @@ void set_fan_speed(int fan_speed) {
+   #endif
+ }
+ 
+-void set_streering_torque(int16_t torque) {
++void set_steering_torque(int16_t torque) {
+ 
+   int clockwise = torque > 0;
+   // Spent one bit on sign, scale back up to 0xFFFF.
+@@ -342,12 +358,11 @@ void set_streering_torque(int16_t torque) {
+   timerCCRx = torque == 0 ? 0 : timerCCRx;
+ 
+   #ifdef DIRECTION_AND_PWM
+-  // PWM on PC6 (channel 1), direction on PC7
+-  TIM3->CCR1 = timerCCRx;
++  MOTOR_DRIVER_PWM_TIMER_CHANNEL = timerCCRx;
+   if (clockwise) {
+-    GPIOC->ODR |= (1 << 7);
++    MOTOR_DRIVER_GPIO->ODR |= MOTOR_DRIVER_DIRECTION_PIN;
+   } else {
+-    GPIOC->ODR &= ~(1 << 7);
++    MOTOR_DRIVER_GPIO->ODR &= ~MOTOR_DRIVER_DIRECTION_PIN;
+   }
+   #else
+   // Cloclwise torque on channel 1, counterclockwise on channel 2.
+@@ -441,7 +456,7 @@ void usb_cb_control_msg() {
+       NVIC_SystemReset();
+       break;
+     case 0xd9: // Steering torque
+-      set_streering_torque(setup.b.wValue.w);
++      set_steering_torque(setup.b.wValue.w);
+       USB_WritePacket(0, 0, 0);
+       USBx_OUTEP(0)->DOEPCTL |= USB_OTG_DOEPCTL_CNAK;
+       break;
+@@ -584,7 +599,7 @@ int main() {
+ 
+   // set PWM
+   set_fan_speed(0x7FFF);
+-  set_streering_torque(0);
++  set_steering_torque(0);
+ 
+   puts("**** INTERRUPTS ON ****\n");
+   __disable_irq();
+@@ -609,8 +624,7 @@ int main() {
+ #endif
+ 
+ #ifdef ENABLE_ROTARY_ENCODER
+-  NVIC_SetPriority(EXTI15_10_IRQn, 3);
+-  NVIC_EnableIRQ(EXTI15_10_IRQn);
++  NVIC_EnableIRQ(ROTARY_ENCODER_INTERRUPT);
+ #endif
+ 
+   __enable_irq();
+@@ -661,7 +675,8 @@ int main() {
+     } else {
+       started = 0;
+       set_fan_speed(0x7FFF);
+-      set_streering_torque(0);
++      set_steering_torque(0);
++      rotary_encoder_count = 0;
+     }
+   }
+ 
+-- 
+2.9.2
+
+
+From 8356f8908e2e470726c4cab3b5bc3a9094eadfad Mon Sep 17 00:00:00 2001
+From: Vehicle Researcher <user@comma.ai>
+Date: Thu, 16 Mar 2017 21:14:12 -0700
+Subject: [PATCH 5/9] Move can read code to controlsd
+
+---
+ board/main.c                     |  2 +-
+ selfdrive/car/honda/interface.py | 18 +-----------------
+ selfdrive/controls/controlsd.py  | 11 +++++++++--
+ 3 files changed, 11 insertions(+), 20 deletions(-)
+
+diff --git a/board/main.c b/board/main.c
+index 5d25e7c..17902ae 100644
+--- a/board/main.c
++++ b/board/main.c
+@@ -11,7 +11,7 @@
+ 
+ #define GPIO_PIN_6 (1 << 6)
+ #define GPIO_PIN_7 (1 << 7)
+-#define GPIO_PIN_14 (1 << 15)
++#define GPIO_PIN_14 (1 << 14)
+ #define GPIO_PIN_15 (1 << 15)
+ 
+ #define ENABLE_ROTARY_ENCODER
+diff --git a/selfdrive/car/honda/interface.py b/selfdrive/car/honda/interface.py
+index 5010e3a..2d94361 100755
+--- a/selfdrive/car/honda/interface.py
++++ b/selfdrive/car/honda/interface.py
+@@ -39,7 +39,7 @@ class BP:
+ class CarInterface(object):
+   def __init__(self, read_only=False):
+     context = zmq.Context()
+-    self.logcan = messaging.sub_sock(context, service_list['can'].port)
++    # self.logcan = messaging.sub_sock(context, service_list['can'].port)
+ 
+     self.frame = 0
+     self.can_invalid_count = 0
+@@ -48,11 +48,6 @@ class CarInterface(object):
+     self.CS = CarState(self.logcan)
+     self.CS.angle_steers = 0.0;
+ 
+-    # Hack-hack - hardcode 27 = 60mph
+-    vEgo = 13;
+-    self.CS.vEgo = vEgo
+-    self.CS.steeringAngle = 0
+-
+     # sending if read only is False
+     if not read_only:
+       # self.sendcan = messaging.pub_sock(context, service_list['sendcan'].port)
+@@ -73,11 +68,6 @@ class CarInterface(object):
+ 
+     ret.steeringAngle = self.CS.angle_steers
+ 
+-    ret.wheelSpeeds.fl = self.CS.vEgo
+-    ret.wheelSpeeds.fr = self.CS.vEgo
+-    ret.wheelSpeeds.rl = self.CS.vEgo
+-    ret.wheelSpeeds.rr = self.CS.vEgo
+-
+     return ret.as_reader()
+ 
+     # speeds
+@@ -161,12 +151,6 @@ class CarInterface(object):
+     # TODO: I don't like the way capnp does enums
+     # These strings aren't checked at compile time
+     errors = []
+-    if not self.CS.can_valid:
+-      self.can_invalid_count += 1
+-      if self.can_invalid_count >= 5:
+-        errors.append('commIssue')
+-    else:
+-      self.can_invalid_count = 0
+     if self.CS.steer_error:
+       errors.append('steerUnavailable')
+     elif self.CS.steer_not_allowed:
+diff --git a/selfdrive/controls/controlsd.py b/selfdrive/controls/controlsd.py
+index 898f437..8ca3d01 100755
+--- a/selfdrive/controls/controlsd.py
++++ b/selfdrive/controls/controlsd.py
+@@ -46,6 +46,7 @@ def controlsd_thread(gctx, rate=100):  #rate in Hz
+   live20 = messaging.sub_sock(context, service_list['live20'].port)
+   model = messaging.sub_sock(context, service_list['model'].port)
+   health = messaging.sub_sock(context, service_list['health'].port)
++  logcan = messaging.sub_sock(context, service_list['can'].port)
+ 
+   # connects to can and sendcan
+   CI = CarInterface()
+@@ -89,7 +90,12 @@ def controlsd_thread(gctx, rate=100):  #rate in Hz
+     cur_time = sec_since_boot()
+ 
+     # read CAN
+-    CS = CI.update()
++    # CS = CI.update()
++    CS = car.CarState.new_message()
++    CS.vEgo = 13
++
++    for a in messaging.drain_sock(logcan):
++      CS.steeringAngle = a.carState.steeringAngle
+ 
+     # broadcast carState
+     cs_send = messaging.new_message()
+@@ -106,7 +112,8 @@ def controlsd_thread(gctx, rate=100):  #rate in Hz
+       # gives the user 6 minutes
+       awareness_status -= 1.0/(100*60*6)
+       if awareness_status <= 0.:
+-        AM.add("driverDistracted", enabled)
++        # AM.add("driverDistracted", enabled)
++        awareness_status = 1.0
+ 
+     # reset awareness status on steering
+     if CS.steeringPressed:
+-- 
+2.9.2
+
+
+From 5f245c799f4925c687dbfdfe87d7286f776b1937 Mon Sep 17 00:00:00 2001
+From: Vehicle Researcher <user@comma.ai>
+Date: Mon, 20 Mar 2017 17:52:25 -0700
+Subject: [PATCH 6/9] Disable steering when not started
+
+---
+ board/main.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/board/main.c b/board/main.c
+index 17902ae..afe8a7d 100644
+--- a/board/main.c
++++ b/board/main.c
+@@ -351,10 +351,14 @@ void set_fan_speed(int fan_speed) {
+ 
+ void set_steering_torque(int16_t torque) {
+ 
++  if (!started)
++    return;
++
+   int clockwise = torque > 0;
+   // Spent one bit on sign, scale back up to 0xFFFF.
+   // With less than minimal cutoff, the motor doesn't spin at all.
+-  int timerCCRx = max(0xFFF, min(0x7FFF, abs(torque) * 2));
++  int timerCCRx = min(0xFFFF, abs(torque) * 2);
++  if (timerCCRx <= 0xFFF) timerCCRx = 0;
+   timerCCRx = torque == 0 ? 0 : timerCCRx;
+ 
+   #ifdef DIRECTION_AND_PWM
+@@ -673,10 +677,10 @@ int main() {
+       started = 1;
+       set_fan_speed(0xFFFF);
+     } else {
+-      started = 0;
+       set_fan_speed(0x7FFF);
+       set_steering_torque(0);
+       rotary_encoder_count = 0;
++      started = 0;
+     }
+   }
+ 
+-- 
+2.9.2
+
+
+From 403dc62f4749e3af4ae26bddf1cff466386c5609 Mon Sep 17 00:00:00 2001
+From: Vehicle Researcher <user@comma.ai>
+Date: Mon, 20 Mar 2017 17:53:00 -0700
+Subject: [PATCH 7/9] Adjust steering conversion to 0.5
+
+---
+ selfdrive/boardd/boardd.cc       | 2 +-
+ selfdrive/car/honda/interface.py | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/selfdrive/boardd/boardd.cc b/selfdrive/boardd/boardd.cc
+index 25599f0..9c58ab6 100644
+--- a/selfdrive/boardd/boardd.cc
++++ b/selfdrive/boardd/boardd.cc
+@@ -91,7 +91,7 @@ void can_recv(void *s) {
+ 
+   auto carState = event.initCarState();
+ 
+-  carState.setSteeringAngle(0.1 * status.rotaryEncoderCount);
++  carState.setSteeringAngle(0.5 * status.rotaryEncoderCount);
+ 
+   // send
+   auto words = capnp::messageToFlatArray(msg);
+diff --git a/selfdrive/car/honda/interface.py b/selfdrive/car/honda/interface.py
+index 2d94361..cb838c4 100755
+--- a/selfdrive/car/honda/interface.py
++++ b/selfdrive/car/honda/interface.py
+@@ -45,7 +45,7 @@ class CarInterface(object):
+     self.can_invalid_count = 0
+ 
+     # *** init the major players ***
+-    self.CS = CarState(self.logcan)
++    self.CS = CarState(None)
+     self.CS.angle_steers = 0.0;
+ 
+     # sending if read only is False
+-- 
+2.9.2
+
+
+From bebd7b87f32976c4b9715e5d1e8e607d185207b5 Mon Sep 17 00:00:00 2001
+From: Vehicle Researcher <user@comma.ai>
+Date: Tue, 21 Mar 2017 20:00:49 -0700
+Subject: [PATCH 8/9] Change motor driver cutoff
+
+---
+ board/main.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/board/main.c b/board/main.c
+index afe8a7d..4b71930 100644
+--- a/board/main.c
++++ b/board/main.c
+@@ -358,7 +358,13 @@ void set_steering_torque(int16_t torque) {
+   // Spent one bit on sign, scale back up to 0xFFFF.
+   // With less than minimal cutoff, the motor doesn't spin at all.
+   int timerCCRx = min(0xFFFF, abs(torque) * 2);
+-  if (timerCCRx <= 0xFFF) timerCCRx = 0;
++  if (timerCCRx <= 0xFFF) {
++    if (timerCCRx > 0x7FF)
++      timerCCRx = 0xFFF;
++    else
++      timerCCRx = 0;
++  }
++
+   timerCCRx = torque == 0 ? 0 : timerCCRx;
+ 
+   #ifdef DIRECTION_AND_PWM
+-- 
+2.9.2
+
+
+From a2eee61ea02c0aa80a0e3171bf144cb90a934e88 Mon Sep 17 00:00:00 2001
+From: Vehicle Researcher <user@comma.ai>
+Date: Tue, 21 Mar 2017 20:01:58 -0700
+Subject: [PATCH 9/9] Wait for visiond bringup
+
+---
+ selfdrive/boardd/boardd.cc      |  2 +-
+ selfdrive/controls/controlsd.py | 10 +++++-----
+ selfdrive/manager.py            |  9 ++++++---
+ 3 files changed, 12 insertions(+), 9 deletions(-)
+
+diff --git a/selfdrive/boardd/boardd.cc b/selfdrive/boardd/boardd.cc
+index 9c58ab6..bd69492 100644
+--- a/selfdrive/boardd/boardd.cc
++++ b/selfdrive/boardd/boardd.cc
+@@ -91,7 +91,7 @@ void can_recv(void *s) {
+ 
+   auto carState = event.initCarState();
+ 
+-  carState.setSteeringAngle(0.5 * status.rotaryEncoderCount);
++  carState.setSteeringAngle(0.4 * status.rotaryEncoderCount);
+ 
+   // send
+   auto words = capnp::messageToFlatArray(msg);
+diff --git a/selfdrive/controls/controlsd.py b/selfdrive/controls/controlsd.py
+index 8ca3d01..0e464af 100755
+--- a/selfdrive/controls/controlsd.py
++++ b/selfdrive/controls/controlsd.py
+@@ -110,7 +110,7 @@ def controlsd_thread(gctx, rate=100):  #rate in Hz
+ 
+     if enabled:
+       # gives the user 6 minutes
+-      awareness_status -= 1.0/(100*60*6)
++      # awareness_status -= 1.0/(100*60*6)
+       if awareness_status <= 0.:
+         # AM.add("driverDistracted", enabled)
+         awareness_status = 1.0
+@@ -150,6 +150,10 @@ def controlsd_thread(gctx, rate=100):  #rate in Hz
+       if b.type == "cancel" and b.pressed:
+         AM.add("disable", enabled)
+ 
++    # Hack-hack
++    if not enabled:
++      enable_request = True
++
+     prof.checkpoint("Buttons")
+ 
+     # *** health checking logic ***
+@@ -205,10 +209,6 @@ def controlsd_thread(gctx, rate=100):  #rate in Hz
+     else:
+       enable_condition = enable_request
+ 
+-    # Hack-hack
+-    enable_request = True
+-    enable_condition = True
+-
+     if enable_request or enable_condition or enabled:
+       # add all alerts from car
+       for alert in CS.errors:
+diff --git a/selfdrive/manager.py b/selfdrive/manager.py
+index 0d38a34..7121806 100755
+--- a/selfdrive/manager.py
++++ b/selfdrive/manager.py
+@@ -45,7 +45,7 @@ unkillable_processes = ['visiond']
+ # processes to end with SIGINT instead of SIGTERM
+ interrupt_processes = ['loggerd']
+ 
+-car_started_processes = ['controlsd', 'loggerd', 'sensord', 'radard', 'calibrationd', 'visiond']
++car_started_processes = ['visiond', 'loggerd', 'sensord', 'radard', 'calibrationd', 'controlsd']
+ 
+ 
+ # ****************** process management functions ******************
+@@ -159,8 +159,8 @@ def manager_init():
+   else:
+     gctx = {
+       "calibration": {
+-        "initial_homography": [1, 0, 150,
+-                               0, 1, 10,
++        "initial_homography": [1.1, 0, 150,
++                               0, 1.15, 10,
+                                0, 0, 1]
+       }
+     }
+@@ -247,6 +247,9 @@ def manager_thread():
+           if p == "loggerd" and logger_dead:
+             kill_managed_process(p)
+           else:
++            # Wait for visiond to get a good camera image
++            if p == "controlsd":
++              time.sleep(2);
+             start_managed_process(p)
+       else:
+         logger_dead = False
+-- 
+2.9.2
+
